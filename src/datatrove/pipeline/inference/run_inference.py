@@ -293,7 +293,13 @@ class InferenceRunner(PipelineStep):
                         text = choice["text"]
 
                     self.queue_sizes.change_queues({"running_requests": -1})
-                    return InferenceResult(text=text, finish_reason=choice["finish_reason"], usage=usage)
+                    reasoning = None
+                    if self.config.use_chat:
+                        msg = choice.get("message", {})
+                        reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+                    return InferenceResult(
+                        text=text, finish_reason=choice["finish_reason"], usage=usage, reasoning=reasoning
+                    )
                 except (ConnectionError, OSError, asyncio.TimeoutError) as e:
                     # This means the server is dead likely, let's try again just to be sure
                     logger.warning(f"Client error: {type(e)} {e}")

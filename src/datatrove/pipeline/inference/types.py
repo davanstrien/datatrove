@@ -18,6 +18,7 @@ class InferenceResult:
     text: str
     finish_reason: str
     usage: dict
+    reasoning: str | None = None  # separated reasoning (gpt-oss `reasoning`, vLLM/sglang `reasoning_content`) — None when the server keeps it inline or the model doesn't think
 
 
 class InferenceError(Exception):
