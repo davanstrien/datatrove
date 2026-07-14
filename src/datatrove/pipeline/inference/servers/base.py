@@ -171,6 +171,8 @@ class InferenceServer(ABC):
         self._is_master = is_master_node()
         self._rank = rank
         self._node_rank = get_node_rank()
+        # Shared keep-alive client, created lazily when config.http_client == "pooled"
+        self._pooled_client = None
 
     # --------------------------------------------------------------------------- #
     # Logging helper methods
@@ -482,6 +484,13 @@ class InferenceServer(ABC):
                 pass
             self._server_monitoring_task = None
 
+        if self._pooled_client is not None:
+            try:
+                await self._pooled_client.aclose()
+            except Exception:
+                pass
+            self._pooled_client = None
+
     # --------------------------------------------------------------------------- #
     # Internal/private methods
     # --------------------------------------------------------------------------- #
@@ -560,6 +569,42 @@ class InferenceServer(ABC):
         if self._server_task:
             self._server_task.cancel()
 
+    def _get_pooled_client(self):
+        """Shared keep-alive httpx client for http_client="pooled".
+
+        Sized to max_concurrent_generations so the run_inference semaphore stays the
+        concurrency gate and the pool's waiter path stays cold. trust_env=False so
+        HTTP_PROXY/ALL_PROXY can never hijack localhost traffic (the raw client ignores
+        proxies too). read=None preserves the raw client's no-read-timeout semantics for
+        multi-minute generations; the finite pool timeout turns any pool-level stall into
+        a retryable error instead of a hang.
+        """
+        if self._pooled_client is None:
+            import httpx
+
+            n = self.config.max_concurrent_generations
+            self._pooled_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=30.0),
+                limits=httpx.Limits(max_connections=n, max_keepalive_connections=n),
+                trust_env=False,
+                follow_redirects=False,
+            )
+        return self._pooled_client
+
+    async def _post(self, url: str, payload: dict) -> tuple[int, bytes]:
+        """POST via the configured client. Transport-level pooled failures are raised as
+        ConnectionError so the retry envelope in run_inference treats them exactly like
+        raw-socket failures (httpx exceptions do not subclass OSError)."""
+        if self.config.http_client != "pooled":
+            return await _raw_post(url, json_data=payload)
+        import httpx
+
+        try:
+            response = await self._get_pooled_client().post(url, json=payload)
+            return response.status_code, response.content
+        except httpx.HTTPError as e:
+            raise ConnectionError(f"pooled http request failed: {e!r}") from e
+
     async def _make_request(self, payload: dict) -> dict:
         """
         Make HTTP request to the server and return the parsed JSON response.
@@ -582,7 +627,7 @@ class InferenceServer(ABC):
             endpoint = "/v1/completions"
 
         url = f"{self.get_base_url()}{endpoint}"
-        status, body = await _raw_post(url, json_data=payload)
+        status, body = await self._post(url, payload)
 
         if status == 400:
             raise InferenceError(None, f"Got BadRequestError from server: {body.decode()}", payload=payload)

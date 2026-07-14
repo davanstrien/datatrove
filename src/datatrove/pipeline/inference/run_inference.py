@@ -93,6 +93,10 @@ class InferenceConfig:
     # distributed, we could probably init inside the server class, so that we can run multiple jobs on same nodes, but this use-case
     # doesn't make much sense, so keep it as is now.
     master_port: int = 9810
+    # HTTP client for requests to the local server. "raw" = a fresh Connection: close
+    # socket per request (inherited from olmocr; immune to connection-pool bugs but pays
+    # TCP setup/teardown on every request). "pooled" = a shared keep-alive httpx client.
+    http_client: Literal["raw", "pooled"] = "raw"
     # Server startup policy (kept configurable because vLLM cold-start time varies
     # a lot with model size, optimization settings, and node contention).
     # Wall-clock timeout for spawning the server subprocess.
