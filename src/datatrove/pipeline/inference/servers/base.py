@@ -252,12 +252,32 @@ class InferenceServer(ABC):
         """Get the base URL for making requests. Defaults to localhost with port."""
         return f"http://localhost:{self._port}"
 
+    def _http_connection_limit(self) -> int:
+        """
+        Get the maximum number of open connections to the server.
+
+        This is `max_concurrent_generations`, capped at the server's batch size times the
+        data-parallel size when `model_kwargs` sets the batch size (`max-num-seqs` for vLLM,
+        `max-running-requests` for SGLang). Requests above the cap wait for a free connection
+        in the client: keeping more connections open than the server can batch slows vLLM down.
+
+        Returns:
+            The connection limit for the HTTP session.
+        """
+        limit = self.config.max_concurrent_generations
+        model_kwargs = {key.replace("_", "-"): value for key, value in (self.config.model_kwargs or {}).items()}
+        batch_size = model_kwargs.get("max-num-seqs") or model_kwargs.get("max-running-requests")
+        if batch_size:
+            dp = model_kwargs.get("data-parallel-size") or model_kwargs.get("dp-size") or self.config.dp
+            limit = min(limit, int(batch_size) * int(dp))
+        return limit
+
     def _get_http_session(self) -> "aiohttp.ClientSession":
         """
         Get the shared HTTP session, creating it on first use.
 
         One pooled session is shared by all requests to this server. The connection
-        limit matches `max_concurrent_generations`, and `request_timeout` bounds each
+        limit comes from `_http_connection_limit`, and `request_timeout` bounds each
         request (None means no limit, for long generations).
 
         Returns:
@@ -267,7 +287,7 @@ class InferenceServer(ABC):
 
         if self._http_session is None or self._http_session.closed:
             connector = aiohttp.TCPConnector(
-                limit=self.config.max_concurrent_generations,
+                limit=self._http_connection_limit(),
                 keepalive_timeout=HTTP_KEEPALIVE_TIMEOUT_SEC,
             )
             self._http_session = aiohttp.ClientSession(

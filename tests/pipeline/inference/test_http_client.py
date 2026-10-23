@@ -83,6 +83,28 @@ def test_request_timeout_is_applied():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "config_kwargs, expected_limit",
+    [
+        ({"max_concurrent_generations": 5000}, 5000),
+        ({"max_concurrent_generations": 5000, "model_kwargs": {"max-num-seqs": 2048}}, 2048),
+        ({"max_concurrent_generations": 5000, "model_kwargs": {"max_num_seqs": 2048}}, 2048),
+        ({"max_concurrent_generations": 5000, "model_kwargs": {"max-running-requests": 1024}}, 1024),
+        ({"max_concurrent_generations": 5000, "model_kwargs": {"max-num-seqs": 1024}, "dp": 2}, 2048),
+        ({"max_concurrent_generations": 5000, "model_kwargs": {"max-num-seqs": 1024, "dp-size": 4}}, 4096),
+        ({"max_concurrent_generations": 500, "model_kwargs": {"max-num-seqs": 2048}}, 500),
+        ({"max_concurrent_generations": 500, "model_kwargs": {"enforce-eager": True}}, 500),
+    ],
+)
+def test_connection_limit_capped_at_server_batch_size(config_kwargs, expected_limit):
+    async def run():
+        # InferenceServer creates an asyncio.Future, so build it inside a running loop
+        client = _LocalServer(_config(**config_kwargs), port=1)
+        assert client._http_connection_limit() == expected_limit
+
+    asyncio.run(run())
+
+
 def test_connection_pool_matches_max_concurrent_generations():
     async def run():
         client = _LocalServer(_config(max_concurrent_generations=1234), port=1)
