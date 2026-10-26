@@ -140,12 +140,15 @@ def _make_coordinator_fakes():
 
     submitted: list[dict] = []
 
-    def fake_run_uv_job(script, *, script_args=None, env=None, **kwargs):
+    def fake_run_uv_job(script, *, script_args=None, env=None, secrets=None, **kwargs):
         submitted.append(env or {})
         with fsspec.open(script_args[0], "rb") as f:  # the pik path (resolve_paths keeps the scheme)
             job_executor = dill.load(f)
-        saved = {key: os.environ.pop(key, None) for key in (ARRAY_INDEX_ENV_VAR, COORDINATOR_ENV_VAR)}
-        os.environ.update({k: v for k, v in (env or {}).items() if k in saved})
+        # a real Job sees its role variable and its secrets as env vars, and nothing from the launcher
+        keys = {ARRAY_INDEX_ENV_VAR, COORDINATOR_ENV_VAR, "HF_TOKEN", *(secrets or {})}
+        saved = {key: os.environ.pop(key, None) for key in keys}
+        os.environ.update({k: v for k, v in (env or {}).items() if k in (ARRAY_INDEX_ENV_VAR, COORDINATOR_ENV_VAR)})
+        os.environ.update(secrets or {})
         try:
             job_executor.run()
         finally:
@@ -179,7 +182,146 @@ def _fake_job(labels: dict, stage: str):
     return job
 
 
+class _ProbeBlock(PipelineStep):
+    """Records, per rank, which secret it saw and when it ran; can be told to fail."""
+
+    name = "probe"
+    type = "test"
+
+    def __init__(self, stage: str, fail: bool = False):
+        super().__init__()
+        self.stage = stage
+        self.fail = fail
+
+    def run(self, data, rank=None, world_size=None):
+        import fsspec
+
+        if self.fail:
+            raise RuntimeError(f"stage {self.stage} failed")
+        fs = fsspec.filesystem("memory")
+        order = len(fs.glob("/jobs-chain-probe/*.json"))  # the fake Hub runs Jobs one at a time
+        seen = {"secret": os.environ.get(f"SECRET_{self.stage}"), "order": order}
+        with fsspec.open(f"memory://jobs-chain-probe/{self.stage}-{rank}.json", "w") as f:
+            json.dump(seen, f)
+        yield 1
+
+
+def _probes():
+    import fsspec
+
+    fs = fsspec.filesystem("memory")
+    found = {}
+    for path in fs.glob("/jobs-chain-probe/*.json"):
+        with fs.open(path, "r") as f:
+            found[path.rsplit("/", 1)[-1].removesuffix(".json")] = json.load(f)
+    return found
+
+
+def _make_chain_hub():
+    """A fake Hub for ``depends=`` chains: runs each Job in-process and records how it ended.
+
+    Like a real Job, each one sees only its role variable and its secrets in its environment, and the
+    pickle is read the moment the Job is submitted.
+    """
+    import fsspec
+
+    jobs: dict[str, dict] = {}
+    roles = (ARRAY_INDEX_ENV_VAR, COORDINATOR_ENV_VAR)
+    secret_names = {"HF_TOKEN"}  # every secret any Job got: a Job must not see another Job's
+
+    def fake_run_uv_job(script, *, script_args=None, env=None, secrets=None, labels=None, **kwargs):
+        job_id = f"job-{len(jobs)}"
+        with fsspec.open(script_args[0], "rb") as f:
+            raw = f.read()
+        record = {"role": "coordinator" if COORDINATOR_ENV_VAR in env else "worker", "labels": labels, "pik": raw}
+        jobs[job_id] = record
+        secret_names.update(secrets or {})
+        saved = {key: os.environ.pop(key, None) for key in {*roles, *secret_names}}
+        os.environ.update({k: v for k, v in env.items() if k in roles})
+        os.environ.update(secrets or {})
+        try:
+            dill.loads(raw).run()
+            record["stage"] = "COMPLETED"
+        except Exception as e:
+            record["stage"], record["error"] = "ERROR", str(e)
+        finally:
+            for key, value in saved.items():
+                os.environ.pop(key, None)
+                if value is not None:
+                    os.environ[key] = value
+        job = MagicMock()
+        job.id, job.url = job_id, f"https://huggingface.co/jobs/{job_id}"
+        return job
+
+    def fake_inspect_job(*, job_id, **kwargs):
+        job = MagicMock()
+        job.status.stage = jobs[job_id]["stage"]
+        return job
+
+    return fake_run_uv_job, fake_inspect_job, jobs
+
+
+def _three_stage_chain(name: str, fail_a: bool = False, **b_kwargs):
+    """A -> B -> C, each stage with its own secret."""
+    common = {"token": "hf_chaintoken", "poll_interval": 0, "max_retries": 0}
+    a = JobsPipelineExecutor(
+        pipeline=[_ProbeBlock("A", fail=fail_a)],
+        tasks=2,
+        logging_dir=f"memory://jobs-chain/{name}/a",
+        job_name="A",
+        secrets={"SECRET_A": "value-a"},
+        **common,
+    )
+    b = JobsPipelineExecutor(
+        pipeline=[_ProbeBlock("B")],
+        tasks=2,
+        logging_dir=f"memory://jobs-chain/{name}/b",
+        job_name="B",
+        secrets={"SECRET_B": "value-b"},
+        depends=a,
+        **common,
+        **b_kwargs,
+    )
+    c = JobsPipelineExecutor(
+        pipeline=[_ProbeBlock("C")],
+        tasks=1,
+        logging_dir=f"memory://jobs-chain/{name}/c",
+        job_name="C",
+        depends=b,
+        **common,
+    )
+    return a, b, c
+
+
+def _no_dependency_wait(seconds):
+    """Polling sleeps are fine; the minutes-long wait for another launcher's dependency is the bug.
+
+    ``launch_job`` sleeps ``2 * 60`` s per check while it waits on a dependency it did not launch; in a
+    single-coordinator chain that wait means the chain is stuck, so the test fails instead of hanging.
+    """
+    if seconds >= 60:
+        raise TimeoutError("would wait for a dependency forever")
+
+
+def _run_with_hub(executor, hub):
+    fake_run, fake_inspect, _ = hub
+    with (
+        patch("huggingface_hub.run_uv_job", fake_run),
+        patch("huggingface_hub.inspect_job", fake_inspect),
+        patch("huggingface_hub.list_jobs", lambda **kw: iter([])),
+        patch("time.sleep", _no_dependency_wait),
+    ):
+        executor.run()
+
+
 class TestJobsExecutor(unittest.TestCase):
+    def setUp(self):
+        import fsspec
+
+        fs = fsspec.filesystem("memory")
+        if fs.exists("/jobs-chain-probe"):
+            fs.rm("/jobs-chain-probe", recursive=True)
+
     def test_local_logging_dir_rejected(self):
         """A local logging_dir cannot be shared with remote Jobs, so it must raise."""
         with self.assertRaises(ValueError):
@@ -680,37 +822,89 @@ class TestJobsExecutor(unittest.TestCase):
             executor.run()
         self.assertEqual(len(submitted), 1)
 
-    def test_dependent_run_submits_the_whole_chain_but_a_small_pickle(self):
-        """Calling `run()` on the last stage alone still starts every stage, each waiting on the previous."""
-        parent_dir = get_datafolder("memory://jobs-coordinator/chain-parent")
-        child_dir = get_datafolder("memory://jobs-coordinator/chain-child")
-        parent = JobsPipelineExecutor(
-            pipeline=[_EmitBlock()], tasks=2, logging_dir=parent_dir, token="t", job_name="parent"
-        )
-        child = JobsPipelineExecutor(
-            pipeline=[_EmitBlock()],
-            tasks=2,
-            logging_dir=child_dir,
-            token="t",
-            job_name="child",
-            depends=parent,
-        )
-        fake_run, submitted = _make_record_only_fake()
-        with patch("huggingface_hub.run_uv_job", fake_run), patch("huggingface_hub.list_jobs", lambda **kw: []):
-            child.run()
+    def test_one_coordinator_runs_the_whole_chain(self):
+        """`run()` on the last stage submits one coordinator, which runs each stage after the previous one."""
+        a, b, c = _three_stage_chain("in-order")
+        hub = _make_chain_hub()
+        _run_with_hub(c, hub)
+        _, _, jobs = hub
 
-        # the dependency has no launcher of its own to wait on, so run() submits it too, upstream first
-        self.assertEqual([job["labels"]["datatrove_job_name"] for job in submitted], ["parent", "child"])
-        self.assertFalse(parent_dir.isfile("ranks_to_run.json"))  # submitted, but nothing runs from here
-        self.assertFalse(child_dir.isfile("ranks_to_run.json"))
+        coordinators = [job for job in jobs.values() if job["role"] == "coordinator"]
+        self.assertEqual([job["labels"]["datatrove_job_name"] for job in coordinators], ["C"])
+        self.assertEqual(coordinators[0]["stage"], "COMPLETED")
+        probes = _probes()
+        self.assertEqual(sorted(probes), ["A-0", "A-1", "B-0", "B-1", "C-0"])
+        # every rank of a stage ran before any rank of the next one
+        order = sorted(probes, key=lambda probe: probes[probe]["order"])
+        self.assertEqual([probe[0] for probe in order], ["A", "A", "B", "B", "C"])
+        for stage in (a, b, c):
+            self.assertTrue(stage.logging_dir.isfile("stats.json"))
 
-        with child_dir.open("executor.pik", "rb") as f:
-            pickled = dill.load(f)
-        self.assertIsNotNone(pickled.depends)
-        self.assertTrue(pickled.depends._launched)  # -> launch_job() waits for completions/ only
-        self.assertEqual(pickled.depends.depends, None)
-        self.assertEqual(pickled.depends.pipeline, [])  # the parent's pipeline stays out of the pickle
-        self.assertEqual(len(parent.pipeline), 1)  # the live parent object was not mutated
+    def test_chain_secrets_reach_each_stage_and_no_pickle(self):
+        """Each stage's workers get that stage's secrets; no pickle any Job reads holds a credential."""
+        a, b, c = _three_stage_chain("secrets")
+        hub = _make_chain_hub()
+        _run_with_hub(c, hub)
+        _, _, jobs = hub
+
+        probes = _probes()
+        self.assertEqual({probes[f"A-{r}"]["secret"] for r in (0, 1)}, {"value-a"})
+        self.assertEqual({probes[f"B-{r}"]["secret"] for r in (0, 1)}, {"value-b"})
+        for job in jobs.values():
+            for credential in (b"hf_chaintoken", b"value-a", b"value-b"):
+                self.assertNotIn(credential, job["pik"])
+
+    def test_chain_rejects_one_secret_name_with_two_values(self):
+        """The coordinator receives every stage's secrets as env vars, so a name cannot carry two values."""
+        a, b, c = _three_stage_chain("secret-clash")
+        b.secrets = {"SECRET_A": "another-value"}
+        with self.assertRaises(ValueError):
+            _run_with_hub(c, _make_chain_hub())
+
+    def test_chain_rejects_two_tokens(self):
+        """Each stage would otherwise run with whichever token the coordinator got."""
+        a, b, c = _three_stage_chain("token-clash")
+        a.token = "hf_othertoken"
+        with self.assertRaises(ValueError):
+            _run_with_hub(c, _make_chain_hub())
+
+    def test_failed_rerun_is_not_hidden_by_old_markers(self):
+        """A dependency rerun that fails stops the chain, even with completion markers from an earlier run."""
+        a, b, c = _three_stage_chain("stale-markers")
+        _run_with_hub(c, _make_chain_hub())
+        a.skip_completed = False  # recompute A: its old completions/ markers stay in place
+        a.pipeline[0].fail = True
+        hub = _make_chain_hub()
+        _run_with_hub(c, hub)
+        _, _, jobs = hub
+
+        coordinator = next(job for job in jobs.values() if job["role"] == "coordinator")
+        self.assertEqual(coordinator["stage"], "ERROR")
+
+    def test_failed_dependency_fails_the_coordinator(self):
+        """A stage with failed tasks stops the chain and the coordinator Job ends as ERROR, without waiting."""
+        a, b, c = _three_stage_chain("fails", fail_a=True)
+        hub = _make_chain_hub()
+        _run_with_hub(c, hub)
+        _, _, jobs = hub
+
+        coordinator = next(job for job in jobs.values() if job["role"] == "coordinator")
+        self.assertEqual(coordinator["stage"], "ERROR")
+        self.assertIn("'A'", coordinator["error"])
+        self.assertEqual(_probes(), {})  # neither B nor C ran
+
+    def test_run_on_dependency_fail_continues_the_chain(self):
+        a, b, c = _three_stage_chain("continues", fail_a=True, run_on_dependency_fail=True)
+        _run_with_hub(c, _make_chain_hub())
+        self.assertIn("B-0", _probes())
+
+    def test_rerun_after_a_failure_restarts_the_failed_stage(self):
+        """Rerunning the same objects resumes from the failed stage instead of waiting on it."""
+        a, b, c = _three_stage_chain("rerun", fail_a=True)
+        _run_with_hub(c, _make_chain_hub())
+        a.pipeline[0].fail = False  # the user fixes stage A and reruns the same script objects
+        _run_with_hub(c, _make_chain_hub())
+        self.assertEqual(sorted(_probes()), ["A-0", "A-1", "B-0", "B-1", "C-0"])
 
     def test_env_coordinator_key_rejected(self):
         """The coordinator role variable is reserved, like the array-index one."""
